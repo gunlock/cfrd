@@ -1,0 +1,7 @@
+services:
+  cfrd:
+    build: .
+    volumes:
+      - ./cfr-parts.yaml:/data/cfr-parts.yaml:ro
+      - ./output:/data/output
+    working_dir: /data

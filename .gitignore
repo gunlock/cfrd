@@ -1,0 +1,22 @@
+# Build output
+build/
+*.html
+
+# ----- Linux -----
+*~
+.directory
+.Trash-*
+.nfs*
+
+# ----- Clang / clangd -----
+.cache/
+
+# ----- Vim -----
+*.swp
+*.swo
+*.swn
+.netrwhist
+tags
+
+# ----- VS Code -----
+.vscode/
