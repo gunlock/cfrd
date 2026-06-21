@@ -1,4 +1,4 @@
-# cfrd — CFR Downloader
+# cfrd — CFR Downloader for Aviators
 
 Builds a single HTML reference document of FAA 14 CFR sections curated for aviators, sourced from the eCFR API. The default section set follows the ASA FAR/AIM and can be customized via `cfr-parts.yaml`.
 
