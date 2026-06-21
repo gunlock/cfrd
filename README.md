@@ -75,9 +75,11 @@ Requires [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](http
 docker compose build
 ```
 
+This produces a local Docker image containing the `cfrd` binary. The binary is not accessible directly on the host — it runs inside the container and writes output to the host only via the volume mount.
+
 ### Run
 
-Create the output directory first, then run:
+The `output/` directory must exist before running — if Docker creates it automatically it will be root-owned and the container cannot write to it.
 
 ```bash
 mkdir -p output
