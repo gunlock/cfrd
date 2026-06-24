@@ -13,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <regex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -233,10 +234,88 @@ static string createTempDir() {
 }
 
 // ---------------------------------------------------------------------------
+// Link rewriting
+// ---------------------------------------------------------------------------
+
+// Collect every id="..." attribute value from all fragments.
+static set<string> collectIds(const list<Fragment>& fragments)
+{
+  set<string> ids;
+  const regex re(R"re(id="([^"]+)")re", regex::optimize);
+  for (const auto& frag : fragments)
+    for (auto it = sregex_iterator(frag.content.begin(), frag.content.end(), re);
+         it != sregex_iterator(); ++it)
+      ids.insert((*it)[1].str());
+  return ids;
+}
+
+// Rewrite eCFR-relative hrefs in a fragment:
+//   /on/DATE/title-N/...  and  /current/...
+// If the resolved anchor target exists in docIds  → local #anchor
+// Otherwise                                       → full https://www.ecfr.gov URL
+static string rewriteLinks(const string& content, const set<string>& docIds)
+{
+  static const string base = "https://www.ecfr.gov";
+
+  // Matches href="/on/..." or href="/current/..."
+  const regex re(R"re(href="(/(on|current)/[^"]*)")re", regex::optimize);
+
+  string result;
+  result.reserve(content.size());
+
+  auto it  = sregex_iterator(content.begin(), content.end(), re);
+  auto end = sregex_iterator();
+  size_t pos = 0;
+
+  for (; it != end; ++it) {
+    const auto& m    = *it;
+    const string url = m[1].str();   // e.g. /on/2026-06-01/title-14/part-61/section-61.56
+
+    result.append(content, pos, m.position() - pos);
+
+    // Extract the fragment anchor if present (e.g. #p-61.56(a))
+    string localId;
+    const auto hashPos = url.find('#');
+    if (hashPos != string::npos) {
+      localId = url.substr(hashPos + 1);
+    } else {
+      // Derive id from the last path component
+      // /on/DATE/title-N/part-P/section-P.S  → P.S
+      // /on/DATE/title-N/part-P              → part-P
+      // /on/DATE/title-N/part-P/appendix-X  → Appendix-X-to-Part-P (eCFR uses this id format)
+      const auto lastSlash = url.rfind('/');
+      if (lastSlash != string::npos) {
+        string seg = url.substr(lastSlash + 1);
+        // Remove query string
+        const auto q = seg.find('?');
+        if (q != string::npos) seg = seg.substr(0, q);
+
+        if (seg.substr(0, 8) == "section-")
+          localId = seg.substr(8);   // "section-61.56" → "61.56"
+        else if (seg.substr(0, 5) == "part-")
+          localId = seg;             // "part-61" → "part-61"
+        else
+          localId = seg;
+      }
+    }
+
+    if (!localId.empty() && docIds.count(localId))
+      result += "href=\"#" + localId + "\"";
+    else
+      result += "href=\"" + base + url + "\"";
+
+    pos = m.position() + m.length();
+  }
+  result.append(content, pos, string::npos);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // HTML writer
 // ---------------------------------------------------------------------------
 static void writeHtml(ofstream& out, const list<PartGroup>& partGroups,
                       const list<Fragment>& fragments, const map<string, string>& partTitles) {
+  const set<string> docIds = collectIds(fragments);
   out << "<!DOCTYPE html>\n"
       << "<html lang=\"en\">\n"
       << "<head>\n"
@@ -284,7 +363,7 @@ static void writeHtml(ofstream& out, const list<PartGroup>& partGroups,
       out << "<div id=\"part-" << partKey << "\">\n";
       currentPart = partKey;
     }
-    out << frag.content << "\n";
+    out << rewriteLinks(frag.content, docIds) << "\n";
   }
   if (!currentPart.empty()) {
     out << "</div>\n";
