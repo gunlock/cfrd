@@ -1,3 +1,7 @@
+#include "cfr_types.h"
+#include "config.hpp"
+#include "ecfr_xsl.h"
+
 #include <CLI/CLI.hpp>
 #include <fmt/base.h>
 #include <httplib.h>
@@ -14,6 +18,7 @@
 #include <optional>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,20 +33,6 @@ volatile sig_atomic_t gAbort = 0;
 static void onSignal(int) {
   gAbort = 1;
 }
-
-// ---------------------------------------------------------------------------
-// Data
-// ---------------------------------------------------------------------------
-struct CFRChunk {
-  string date;
-  string title;
-  optional<string> chapter;
-  optional<string> subchapter;
-  optional<string> part;
-  optional<string> subpart;
-  optional<string> section; // formatted as "part.section", e.g. "61.1"
-  optional<string> appendix;
-};
 
 // ---------------------------------------------------------------------------
 // YAML parsing
@@ -133,6 +124,10 @@ static string buildPath(const CFRChunk& call) {
   return "/api/renderer/v1/content/enhanced/" + call.date + "/title-" + call.title;
 }
 
+static string buildXmlPath(const CFRChunk& call) {
+  return "/api/versioner/v1/full/" + call.date + "/title-" + call.title + ".xml";
+}
+
 static httplib::Params buildParams(const CFRChunk& call) {
   httplib::Params params;
   auto add = [&](const string& key, const optional<string>& val) {
@@ -169,7 +164,7 @@ static string generateFilename(const CFRChunk& call) {
   if (call.appendix) {
     name += "-appendix-" + *call.appendix;
   }
-  return name + ".html";
+  return name;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +306,56 @@ static string rewriteLinks(const string& content, const set<string>& docIds)
 }
 
 // ---------------------------------------------------------------------------
+// XML writer
+// ---------------------------------------------------------------------------
+// Escape special XML characters in plain text before embedding in XML.
+static string xmlEscape(const string& s) {
+  string r;
+  r.reserve(s.size());
+  for (char c : s) {
+    if      (c == '&') r += "&amp;";
+    else if (c == '<') r += "&lt;";
+    else if (c == '>') r += "&gt;";
+    else               r += c;
+  }
+  return r;
+}
+
+static string buildXmlString(const list<Fragment>& fragments,
+                               const map<string, string>& partTitles = {}) {
+  ostringstream oss;
+  oss << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<cfr>\n";
+
+  // Embed part title metadata so the XSL can display descriptions in the TOC.
+  if (!partTitles.empty()) {
+    oss << "<cfr-meta>\n";
+    for (const auto& [partN, desc] : partTitles)
+      oss << "  <cfr-part n=\"" << partN << "\">" << xmlEscape(desc) << "</cfr-part>\n";
+    oss << "</cfr-meta>\n";
+  }
+
+  for (const auto& frag : fragments) {
+    string content = frag.content;
+    // Strip per-fragment XML declaration so the combined document stays valid
+    if (content.size() >= 5 && content.substr(0, 5) == "<?xml") {
+      const auto end = content.find("?>");
+      if (end != string::npos) {
+        content = content.substr(end + 2);
+        const auto start = content.find_first_not_of(" \t\r\n");
+        if (start != string::npos) content = content.substr(start);
+      }
+    }
+    oss << content << "\n";
+  }
+  oss << "</cfr>\n";
+  return oss.str();
+}
+
+static void writeXml(ofstream& out, const list<Fragment>& fragments) {
+  out << buildXmlString(fragments);
+}
+
+// ---------------------------------------------------------------------------
 // HTML writer
 // ---------------------------------------------------------------------------
 static void writeHtml(ofstream& out, const list<PartGroup>& partGroups,
@@ -382,17 +427,37 @@ int main(int argc, char* argv[]) {
 
   // Parse CLI arguments
   CLI::App app{"FAA CFR downloader"};
-  app.set_version_flag("--version", "0.1.0");
+  app.set_version_flag("--version", CFRD_VERSION);
 
   string yamlPath;
   string outputDir = filesystem::current_path().string();
-  bool testMode = false;
+  string cssPath;
+  bool testMode   = false;
+  bool xmlMode    = false;
+  bool styledMode = false;
+  bool cacheMode  = false;
 
   app.add_option("parts", yamlPath, "Parts YAML file (e.g. cfr-parts.yaml)")->required();
   app.add_option("-o,--output", outputDir, "Output directory (default: cwd)");
   app.add_flag("-t,--test", testMode, "Limit to first 5 calls for testing");
+  app.add_flag("--xml", xmlMode, "Output raw XML instead of HTML");
+  app.add_flag("--styled", styledMode,
+               "Apply ecfr.xsl and embed CSS for styled HTML output");
+  app.add_option("--css", cssPath,
+                 "CSS file to embed instead of the built-in default (requires --styled)");
+  app.add_flag("--cache", cacheMode,
+               "Persist downloaded fragment files and reuse them on subsequent runs "
+               "(cache stored in cfrd-cache/<yaml-stem>/ beside the YAML file)");
 
   CLI11_PARSE(app, argc, argv);
+
+  if (styledMode && xmlMode) {
+    fmt::println("Warning: --styled and --xml are mutually exclusive; --xml takes precedence.");
+    styledMode = false;
+  }
+  if (!cssPath.empty() && !styledMode) {
+    fmt::println("Warning: --css has no effect without --styled, ignoring.");
+  }
 
   // Parse the YAML config into a list of CFRChunk API calls
   list<CFRChunk> calls = parseYaml(yamlPath);
@@ -403,16 +468,28 @@ int main(int argc, char* argv[]) {
     fmt::println("Test mode: limiting to first 5 calls");
   }
 
-  const size_t total = calls.size();
+  const size_t total   = calls.size();
+  const string yamlStem = filesystem::path(yamlPath).stem().string();
   fmt::println("Loaded {} API calls", total);
 
-  // Create a temp directory to stage downloaded fragments
-  const string tmpDir = createTempDir();
-  if (tmpDir.empty()) {
-    fmt::println("Failed to create temp directory.");
-    return 1;
+  // Set up the working directory for downloaded fragment files.
+  // --cache: persistent directory beside the YAML, reused across runs.
+  // default: random /tmp directory, deleted on successful completion.
+  const string cacheDir = (filesystem::path(yamlPath).parent_path()
+                            / "cfrd-cache" / yamlStem).string();
+  string workDir;
+  if (cacheMode) {
+    workDir = cacheDir;
+    filesystem::create_directories(workDir);
+    fmt::println("Cache directory: {}", workDir);
+  } else {
+    workDir = createTempDir();
+    if (workDir.empty()) {
+      fmt::println("Failed to create temp directory.");
+      return 1;
+    }
+    fmt::println("Staging downloads in {}", workDir);
   }
-  fmt::println("Staging downloads in {}", tmpDir);
 
   // Set up the HTTPS client
   httplib::SSLClient client("www.ecfr.gov");
@@ -420,14 +497,21 @@ int main(int argc, char* argv[]) {
   client.set_connection_timeout(30);
   client.set_read_timeout(60);
 
-  // Fetch part titles from the eCFR structure API for TOC headings
+  // Fetch part titles from the eCFR structure API for TOC headings.
+  // Used by both the HTML renderer and the styled XSL path; skipped for
+  // raw XML output where no TOC is generated.
   const string date = calls.front().date;
   const string title = calls.front().title;
-  fmt::println("Fetching title {} structure...", title);
-  const auto partTitles = fetchPartTitles(client, date, title);
+  map<string, string> partTitles;
+  if (!xmlMode) {
+    fmt::println("Fetching title {} structure...", title);
+    partTitles = fetchPartTitles(client, date, title);
+  }
 
-  // Download each CFR chunk sequentially, writing fragments to temp dir
-  size_t completed = 0;
+  // Download each CFR chunk sequentially, writing fragments to the work dir.
+  // With --cache, files that already exist on disk are used as-is.
+  size_t completed   = 0;
+  size_t cachedCount = 0;
   list<pair<CFRChunk, string>> downloaded; // (call, filename) in download order
 
   for (const auto& call : calls) {
@@ -436,18 +520,46 @@ int main(int argc, char* argv[]) {
       break;
     }
 
-    const auto res = client.Get(buildPath(call), buildParams(call), httplib::Headers{});
+    const bool useXmlApi = xmlMode || styledMode;
+    const string filename = generateFilename(call) + (useXmlApi ? ".xml" : ".html");
+    const string filepath = workDir + "/" + filename;
+
+    // Cache hit: reuse existing file, no network call needed
+    if (cacheMode && filesystem::exists(filepath)) {
+      downloaded.emplace_back(call, filename);
+      fmt::println("  ↺ {} (cached)", filename);
+      ++completed;
+      ++cachedCount;
+      continue;
+    }
+
+    const string reqPath = useXmlApi ? buildXmlPath(call) : buildPath(call);
+    const httplib::Params params = buildParams(call);
+
+    // Retry up to 3 times on transient server errors (503, 429).
+    // Backoff: 2 s, 4 s, 8 s between attempts.
+    httplib::Result res{nullptr, httplib::Error::Success};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      res = client.Get(reqPath, params, httplib::Headers{});
+      if (res && (res->status == 503 || res->status == 429)) {
+        const int waitSec = 2 << attempt; // 2, 4, 8
+        fmt::println("  ↻ HTTP {} — retrying in {}s (attempt {}/3)",
+                     res->status, waitSec, attempt + 1);
+        this_thread::sleep_for(chrono::seconds(waitSec));
+        continue;
+      }
+      break;
+    }
 
     if (!res || res->status != 200) {
       const string err =
-          buildPath(call) + (res ? " HTTP " + to_string(res->status) : " (no response)");
+          reqPath + (res ? " HTTP " + to_string(res->status) : " (no response)");
       errors.push_back(err);
       fmt::println("  ✗ {}", err);
       continue;
     }
 
-    const string filename = generateFilename(call);
-    ofstream ofs(tmpDir + "/" + filename);
+    ofstream ofs(filepath);
     if (!ofs) {
       errors.push_back("Failed to write: " + filename);
       fmt::println("  ✗ Failed to write: {}", filename);
@@ -465,36 +577,63 @@ int main(int argc, char* argv[]) {
   if (!gAbort && !downloaded.empty()) {
     filesystem::create_directories(outputDir);
 
-    // Buffer all fragment content from temp dir
+    // Buffer all fragment content from the work directory
     list<Fragment> fragments;
     for (const auto& [call, filename] : downloaded) {
-      ifstream in(tmpDir + "/" + filename);
+      ifstream in(workDir + "/" + filename);
       fragments.push_back(
           {call, filename, string(istreambuf_iterator<char>(in), istreambuf_iterator<char>())});
     }
 
-    // Group fragments by part to drive TOC structure
-    list<PartGroup> partGroups;
-    for (const auto& frag : fragments) {
-      const string partKey = frag.call.part.value_or("unknown");
-      if (partGroups.empty() || partGroups.back().partKey != partKey) {
-        partGroups.push_back({partKey, {}});
+    const string ext     = xmlMode ? ".xml" : ".html";
+    const string outFile = (filesystem::path(outputDir) / yamlStem).string() + ext;
+
+    if (xmlMode) {
+      ofstream out(outFile);
+      writeXml(out, fragments);
+    } else if (styledMode) {
+      // Load CSS: user-supplied file or built-in default
+      string css(kEcfrDefaultCss);
+      if (!cssPath.empty()) {
+        ifstream cssFile(cssPath);
+        if (!cssFile) {
+          fmt::println("Warning: cannot read --css file '{}', using default.", cssPath);
+        } else {
+          css = string(istreambuf_iterator<char>(cssFile), {});
+        }
       }
-      for (const auto& entry : extractHeadings(frag.content)) {
-        partGroups.back().sections.emplace_back(entry.id, entry.text);
+      const string xmlContent = buildXmlString(fragments, partTitles);
+      applyEcfrXslFromString(xmlContent, css, outFile);
+    } else {
+      // Group fragments by part to drive TOC structure
+      list<PartGroup> partGroups;
+      for (const auto& frag : fragments) {
+        const string partKey = frag.call.part.value_or("unknown");
+        if (partGroups.empty() || partGroups.back().partKey != partKey) {
+          partGroups.push_back({partKey, {}});
+        }
+        for (const auto& entry : extractHeadings(frag.content)) {
+          partGroups.back().sections.emplace_back(entry.id, entry.text);
+        }
       }
+      ofstream out(outFile);
+      writeHtml(out, partGroups, fragments, partTitles);
     }
 
-    // Write combined HTML then clean up temp dir
-    const string outFile =
-        (filesystem::path(outputDir) / filesystem::path(yamlPath).stem()).string() + ".html";
-    ofstream out(outFile);
-    writeHtml(out, partGroups, fragments, partTitles);
+    if (!cacheMode) {
+      filesystem::remove_all(workDir);
+    }
 
-    filesystem::remove_all(tmpDir);
-    fmt::println("\n{}/{} calls completed. Combined HTML: {}", completed, total, outFile);
+    if (cachedCount > 0) {
+      fmt::println("\n{}/{} calls completed ({} cached, {} downloaded). Output: {}",
+                   completed, total, cachedCount, completed - cachedCount, outFile);
+    } else {
+      fmt::println("\n{}/{} calls completed. Output: {}", completed, total, outFile);
+    }
   } else if (gAbort) {
-    fmt::println("Temp files retained in: {}", tmpDir);
+    if (!cacheMode) {
+      fmt::println("Temp files retained in: {}", workDir);
+    }
   }
 
   // Report any errors

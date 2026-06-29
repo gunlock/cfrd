@@ -1,0 +1,9 @@
+services:
+  cfrd:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../cfr-parts.yaml:/data/cfr-parts.yaml:ro
+      - ../output:/data/output
+    working_dir: /data

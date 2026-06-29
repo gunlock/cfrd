@@ -1,6 +1,7 @@
 # Build output
 build/
 output/
+cfrd-cache/
 *.html
 
 # ----- Linux -----

@@ -1,0 +1,3 @@
+#pragma once
+
+#define CFRD_VERSION "@PROJECT_VERSION@"

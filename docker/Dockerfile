@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     ninja-build \
     libssl-dev \
+    libxml2-dev \
+    libxslt1-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,6 +22,8 @@ FROM ubuntu:24.04 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
+    libxml2 \
+    libxslt1.1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,6 +1,7 @@
 # CFR Downloader
 cmake_minimum_required(VERSION 3.25)
-project(cfrd LANGUAGES CXX)
+
+project(cfrd VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,6 +47,12 @@ FetchContent_MakeAvailable(cli11)
 find_package(OpenSSL REQUIRED)
 
 # ---------------------------------------------------------------------------
+# libxml2 + libxslt (system) — required for govinfo XML parsing and XSL
+# ---------------------------------------------------------------------------
+find_package(LibXml2 REQUIRED)
+find_package(LibXslt REQUIRED)
+
+# ---------------------------------------------------------------------------
 # cpp-httplib v0.48.0
 # ---------------------------------------------------------------------------
 FetchContent_Declare(
@@ -56,9 +63,19 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(httplib)
 
 # ---------------------------------------------------------------------------
+# Version header — generated from src/config.hpp.in into the build tree
+# ---------------------------------------------------------------------------
+configure_file(src/config.hpp.in src/config.hpp @ONLY)
+
+# ---------------------------------------------------------------------------
 # Main executable
 # ---------------------------------------------------------------------------
-add_executable(cfrd main.cpp)
+add_executable(cfrd
+  src/main.cpp
+  src/ecfr_xsl.cpp
+)
+
+target_include_directories(cfrd PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/src)
 
 target_link_libraries(cfrd PRIVATE
   fmt::fmt
@@ -67,4 +84,6 @@ target_link_libraries(cfrd PRIVATE
   OpenSSL::SSL
   OpenSSL::Crypto
   CLI11::CLI11
+  LibXml2::LibXml2
+  LibXslt::LibXslt
 )
